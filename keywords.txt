@@ -1,0 +1,80 @@
+# Bangladesh fuel/oil/LNG queries rendered from data-scraper/config/search-queries.yaml.
+# Keep these first because they match the approved BD scope and target measures.
+Energy Scenario of Bangladesh
+Bangladesh petroleum annual report imports sales capacity
+Bangladesh natural gas annual report LNG RLNG demand supply
+Bangladesh petroleum products demand consumption sales
+Bangladesh crude oil import quantity volume
+Bangladesh petroleum import value unit value landed cost
+Bangladesh diesel HSD demand consumption sales
+Bangladesh high speed diesel import value price cost
+Bangladesh petrol gasoline octane demand imports
+Bangladesh kerosene SKO demand imports
+Bangladesh furnace oil fuel oil demand quantity cost
+Bangladesh bitumen import quantity cost
+Bangladesh petroleum throughput stock cargo imports
+Bangladesh petroleum subsidy price tariff freight
+
+# Bangladesh storage, depot, terminal, distance, and lead-time queries.
+Bangladesh petroleum storage capacity tank capacity depot terminal
+Bangladesh fuel depot tank capacity terminal capacity
+Bangladesh petroleum terminal capacity Chattogram Mongla Payra
+Bangladesh petroleum storage facility tank farm capacity
+Bangladesh refinery capacity pipeline capacity petroleum
+Bangladesh fuel depot distance route length transport distance
+Bangladesh oil depot road distance shipping distance
+Bangladesh fuel lead time transit time delivery time
+Bangladesh petroleum turnaround time dwell time customs clearance time
+Bangladesh fuel loading time unloading time replenishment time
+Chattogram petroleum depot storage capacity Bangladesh
+Mongla fuel depot terminal capacity Bangladesh
+Payra fuel terminal storage capacity Bangladesh
+
+# Bangladesh gas, LNG, LPG, FSRU, RLNG queries.
+Bangladesh LNG import demand supply regasification capacity
+Bangladesh liquefied natural gas import volume cost
+Bangladesh natural gas demand consumption requirement forecast
+Bangladesh RLNG demand supply capacity
+Bangladesh LPG import demand price quantity
+Bangladesh CNG autogas demand supply price
+Maheshkhali LNG FSRU regasification capacity Bangladesh
+Bangladesh LNG FSRU terminal capacity lead time
+Bangladesh gas pipeline length distance capacity
+
+# Bangladesh fertilizer import and logistics queries.
+Bangladesh fertilizer import quantity volume cost
+Bangladesh fertilizer import data quantity price
+Bangladesh fertilizer demand consumption requirement forecast
+Bangladesh fertilizer supply chain demand lead time
+Bangladesh fertilizer distribution warehouse depot distance
+Bangladesh fertilizer logistics transportation cost demand
+Bangladesh fertilizer storage capacity warehouse depot
+Bangladesh urea fertilizer import volume price
+Bangladesh DAP fertilizer import quantity cost
+Bangladesh TSP MOP fertilizer import quantity cost
+
+# Dataset/article discovery versions for Data in Brief, Scientific Data, IEEE, and Crossref.
+Bangladesh petroleum supply chain dataset
+Bangladesh petroleum logistics dataset
+Bangladesh fuel distribution dataset
+Bangladesh LNG import dataset
+Bangladesh fuel depot capacity dataset
+Bangladesh petroleum storage capacity dataset
+Bangladesh fuel demand cost quantity dataset
+Bangladesh fuel lead time distance dataset
+Bangladesh fertilizer import dataset
+Bangladesh fertilizer supply chain dataset
+Bangladesh fertilizer logistics dataset
+Bangladesh fertilizer demand cost quantity dataset
+
+# Broad fallback discovery queries for recall when Bangladesh-specific searches are too sparse.
+supply chain dataset fuel logistics
+logistics dataset petroleum fuel
+warehouse depot storage capacity dataset
+transportation cost lead time dataset
+facility location depot capacity dataset
+vehicle routing depot capacity distance
+oil import demand quantity cost dataset
+LNG supply chain demand cost distance
+fertilizer import demand quantity cost dataset
+fertilizer distribution warehouse capacity distance

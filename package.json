@@ -1,0 +1,20 @@
+{
+  "name": "datasets-generator",
+  "version": "1.0.0",
+  "description": "Keyword-based article and dataset discovery scraper for logistics/supply-chain datasets.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/scraper.js",
+    "check": "node --check src/scraper.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "puppeteer": "^24.15.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "puppeteer@24.43.1": true
+  }
+}

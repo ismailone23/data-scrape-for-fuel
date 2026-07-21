@@ -99,34 +99,31 @@ export const apiSources = [
   {
     name: "Crossref Data Journals",
     async search(keyword, { rows, mailto, fetchJson }) {
-      // Crossref accepts only one ISSN per filter clause, so fan out and merge.
-      const requests = DATA_JOURNAL_ISSNS.map(issn => {
-        const params = new URLSearchParams({
-          "query.bibliographic": keyword,
-          filter: `issn:${issn},type:journal-article`,
-          select: "title,container-title,DOI,URL,abstract,published,score",
-          rows: String(Math.min(rows, 100)),
-        });
-
-        if (mailto) params.set("mailto", mailto);
-
-        return `https://api.crossref.org/works?${params}`;
+      // Repeated same-field filters are OR-ed by Crossref, so every data journal
+      // fits in one request. Fanning out per ISSN was 5x the load for the same
+      // result set and was a large part of what got the run rate-limited.
+      const params = new URLSearchParams({
+        "query.bibliographic": keyword,
+        filter: `${DATA_JOURNAL_ISSNS.map(issn => `issn:${issn}`).join(",")},type:journal-article`,
+        select: "title,container-title,DOI,URL,abstract,published,score",
+        rows: String(Math.min(rows, 100)),
       });
 
-      const responses = await Promise.all(requests.map(url => fetchJson(url)));
+      if (mailto) params.set("mailto", mailto);
 
-      return responses.flatMap((data, index) =>
-        (data?.message?.items ?? []).map(item => ({
-          title: stripHtml(item.title?.[0]),
-          abstract: stripHtml(item.abstract),
-          journal: item["container-title"]?.[0] ?? "",
-          doi: item.DOI ?? "",
-          published: crossrefDate(item),
-          url: item.URL || doiUrl(item.DOI),
-          kind: "journal-article",
-          searchUrl: requests[index],
-        })),
-      );
+      const searchUrl = `https://api.crossref.org/works?${params}`;
+      const data = await fetchJson(searchUrl);
+
+      return (data?.message?.items ?? []).map(item => ({
+        title: stripHtml(item.title?.[0]),
+        abstract: stripHtml(item.abstract),
+        journal: item["container-title"]?.[0] ?? "",
+        doi: item.DOI ?? "",
+        published: crossrefDate(item),
+        url: item.URL || doiUrl(item.DOI),
+        kind: "journal-article",
+        searchUrl,
+      }));
     },
   },
   {

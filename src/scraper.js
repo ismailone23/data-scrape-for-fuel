@@ -17,8 +17,9 @@ const REQUIRE_TITLE_COMMODITY = process.env.REQUIRE_TITLE_COMMODITY !== "0";
 const WAIT_BETWEEN_SEARCHES_MS = Number(process.env.WAIT_BETWEEN_SEARCHES_MS || 300);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.NAVIGATION_TIMEOUT_MS || 60000);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 30000);
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 4);
-const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 2000);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 2);
+const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 1000);
+const HOST_COOLDOWN_MS = Number(process.env.HOST_COOLDOWN_MS || 60000);
 const KEYWORD_LIMIT = Number(process.env.KEYWORD_LIMIT || 0);
 const SOURCE_FILTER = process.env.SOURCE_FILTER || "";
 const SINGLE_QUERY = process.env.QUERY || "";
@@ -80,7 +81,6 @@ const CSV_COLUMNS = [
   "commodity",
   "measure",
   "keyword",
-  "searchUrl",
 ];
 
 function toCsv(rows) {
@@ -93,10 +93,30 @@ function toCsv(rows) {
   return `${lines.join("\n")}\n`;
 }
 
+// A host that is refusing traffic will refuse the next call too. Retrying every
+// request against it turned a 20-minute run into a projected 2.7-hour one, so a
+// host in cooldown fails fast instead.
+const hostCooldownUntil = new Map();
+
+function isHostInCooldown(host) {
+  const until = hostCooldownUntil.get(host) ?? 0;
+
+  if (until === 0) return false;
+  if (Date.now() < until) return true;
+
+  hostCooldownUntil.delete(host);
+
+  return false;
+}
+
 // OpenAlex throttles hard over a long run and answers 429. Without a retry the
 // source silently contributes nothing for the rest of the run, which is exactly
 // what happened before this was added.
 async function fetchJson(url, attempt = 0) {
+  const host = new URL(url).host;
+
+  if (isHostInCooldown(host)) return null;
+
   try {
     const response = await fetch(url, {
       headers: {
@@ -108,14 +128,19 @@ async function fetchJson(url, attempt = 0) {
 
     if (response.status === 429 || response.status >= 500) {
       if (attempt >= MAX_RETRIES) {
-        console.warn(`  ! ${response.status} after ${MAX_RETRIES} retries: ${new URL(url).host}`);
+        hostCooldownUntil.set(host, Date.now() + HOST_COOLDOWN_MS);
+        console.warn(
+          `  ! ${host} returned ${response.status}; pausing it for ${HOST_COOLDOWN_MS / 1000}s`,
+        );
+
         return null;
       }
 
       const retryAfter = Number(response.headers.get("retry-after"));
-      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0
-        ? retryAfter * 1000
-        : RETRY_BASE_MS * 2 ** attempt;
+      const backoffMs =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : RETRY_BASE_MS * 2 ** attempt;
 
       await sleep(backoffMs);
 

@@ -74,7 +74,8 @@ Supplying a mail address puts both Crossref and OpenAlex in their polite pools,
 which is faster and less likely to be throttled.
 
 Results are written to `data/articles.json` and `data/articles.csv`, sorted by
-score descending.
+score descending. `articles.csv` keeps the DOI/landing `url` but omits
+`searchUrl`; the JSON keeps `searchUrl` for provenance.
 
 ## Options
 
@@ -150,10 +151,18 @@ Outputs:
 
 | File | Contents |
 | --- | --- |
+| `data/records.json` | canonical grouped extraction output: one article record with tables, figures, dataset links, errors, and a `statistics` slot |
+| `data/records.csv` | flat evidence index for spreadsheets: article, table, figure, dataset link, and future statistic rows share one schema |
 | `data/tables/<doi-slug>-t<N>.csv` | one CSV per extracted HTML table |
-| `data/tables.csv` | table index — doi, caption, rows, columns, source file |
-| `data/figures.csv` | figure captions and image URLs |
-| `data/datasets.csv` | links to Mendeley Data, figshare, Zenodo, Dryad, OSF, … |
+| `data/dataset-files/*` | public files downloaded from DOI/repository links when discoverable |
+| `data/tables.csv` | compatibility table index: doi, caption, rows, columns, source file |
+| `data/figures.csv` | compatibility export of figure captions and image URLs |
+| `data/datasets.csv` | dataset DOI/repository links plus resolved URL, download status, and local files |
+
+Use `data/records.json` as the primary handoff between stages. It keeps the
+article metadata, extraction provenance, table files, figure references, dataset
+links, failed candidate URLs, and future statistics in one place instead of
+forcing later scripts to join separate outputs.
 
 ### How a page is reached
 
@@ -180,6 +189,10 @@ papers to produce tables and economics papers to produce nothing.
 `data/datasets.csv` is often the more valuable output: a Data in Brief article
 typically links a Mendeley Data or figshare deposit holding the real numeric
 files, which is a better source than any table scraped from the article body.
+Extraction now keeps the DOI/repository URL and also tries to download public
+data files from that resolved DOI page. Direct file URLs, Zenodo records,
+Figshare records, and obvious landing-page links such as `.csv`, `.xlsx`, and
+`.zip` are supported.
 
 ### Options
 
@@ -189,6 +202,9 @@ EXTRACT_MIN_SCORE=70 npm run extract     # only high-confidence rows (default 60
 MIN_TABLE_ROWS=3 npm run extract         # drop small layout tables (default 2)
 MIN_TABLE_COLS=3 npm run extract         # default 2
 PAGE_WAIT_MS=6000 npm run extract        # slower sites
+DOWNLOAD_DATASET_FILES=0 npm run extract # keep URLs only
+DATASET_FILE_LIMIT=5 npm run extract     # files per DOI/repository link (default 3)
+DATASET_MAX_BYTES=50000000 npm run extract # max bytes per downloaded file
 ```
 
 ## Notes

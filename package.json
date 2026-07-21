@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/scraper.js",
-    "check": "node --check src/scraper.js"
+    "check": "node --check src/scraper.js && node --check src/sources.js && node --check src/queries.js && node --check src/relevance.js && node --check src/extract.js && node --check src/csv.js",
+    "extract": "node src/extract.js"
   },
   "dependencies": {
     "cheerio": "^1.1.2",

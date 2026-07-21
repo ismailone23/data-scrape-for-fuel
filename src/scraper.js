@@ -3,20 +3,27 @@ import path from "node:path";
 import process from "node:process";
 import * as cheerio from "cheerio";
 import puppeteer from "puppeteer";
-import { sites } from "./sites.js";
+import { apiSources, browserSources } from "./sources.js";
+import { buildQueryVariants } from "./queries.js";
+import { scoreCandidate } from "./relevance.js";
 
 const ROOT_DIR = process.cwd();
 const KEYWORDS_FILE = path.join(ROOT_DIR, "keywords.txt");
 const OUTPUT_DIR = path.join(ROOT_DIR, "data");
-const MAX_RESULTS_PER_SEARCH = Number(process.env.MAX_RESULTS_PER_SEARCH || 20);
-const WAIT_BETWEEN_SEARCHES_MS = Number(process.env.WAIT_BETWEEN_SEARCHES_MS || 3500);
+const MAX_RESULTS_PER_SEARCH = Number(process.env.MAX_RESULTS_PER_SEARCH || 50);
+const MAX_QUERY_VARIANTS = Number(process.env.MAX_QUERY_VARIANTS || 4);
+const MIN_SCORE = Number(process.env.MIN_SCORE || 45);
+const REQUIRE_TITLE_COMMODITY = process.env.REQUIRE_TITLE_COMMODITY !== "0";
+const WAIT_BETWEEN_SEARCHES_MS = Number(process.env.WAIT_BETWEEN_SEARCHES_MS || 300);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.NAVIGATION_TIMEOUT_MS || 60000);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 30000);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 4);
+const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 2000);
 const KEYWORD_LIMIT = Number(process.env.KEYWORD_LIMIT || 0);
-const SITE_FILTER = process.env.SITE_FILTER || "";
+const SOURCE_FILTER = process.env.SOURCE_FILTER || "";
 const SINGLE_QUERY = process.env.QUERY || "";
-const CROSSREF_MAILTO = process.env.CROSSREF_MAILTO || "";
-const STRICT_CROSSREF_RELEVANCE = process.env.STRICT_CROSSREF_RELEVANCE !== "0";
+const MAILTO = process.env.CROSSREF_MAILTO || process.env.OPENALEX_MAILTO || "";
+const SKIP_BROWSER = process.env.SKIP_BROWSER === "1";
 const USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36";
 const BLOCK_TEXT_MARKERS = [
@@ -33,102 +40,94 @@ const SYSTEM_BROWSER_PATHS = [
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
 ];
-const FUEL_TERMS = [
-  "crude oil",
-  "petroleum",
-  "petroleum products",
-  "refined oil",
-  "diesel",
-  "hsd",
-  "high speed diesel",
-  "petrol",
-  "motor spirit",
-  "gasoline",
-  "octane",
-  "hobc",
-  "kerosene",
-  "sko",
-  "jet a-1",
-  "jet fuel",
-  "furnace oil",
-  "fuel oil",
-  "hsfo",
-  "ldo",
-  "light diesel oil",
-  "naphtha",
-  "bitumen",
-  "condensate",
-  "natural gas",
-  "pipeline gas",
-  "liquefied natural gas",
-  "lng",
-  "regasified lng",
-  "rlng",
-  "liquefied petroleum gas",
-  "lpg",
-  "autogas",
-  "compressed natural gas",
-  "cng",
-  "fuel",
-  "oil",
-];
-const FERTILIZER_TERMS = ["fertilizer", "fertiliser", "urea", "dap", "tsp", "mop"];
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function normalizeWhitespace(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
 async function readKeywords() {
-  if (SINGLE_QUERY) {
-    return [SINGLE_QUERY];
-  }
+  if (SINGLE_QUERY) return [SINGLE_QUERY];
 
   const raw = await fs.readFile(KEYWORDS_FILE, "utf8");
-
   const keywords = raw
     .split("\n")
     .map(line => line.trim())
     .filter(line => line && !line.startsWith("#"));
 
-  if (KEYWORD_LIMIT > 0) {
-    return keywords.slice(0, KEYWORD_LIMIT);
-  }
-
-  return keywords;
-}
-
-function normalizeWhitespace(value) {
-  return value.replace(/\s+/g, " ").trim();
+  return KEYWORD_LIMIT > 0 ? keywords.slice(0, KEYWORD_LIMIT) : keywords;
 }
 
 function csvEscape(value) {
   const text = String(value ?? "");
 
-  if (/[",\n\r]/.test(text)) {
-    return `"${text.replaceAll('"', '""')}"`;
-  }
-
-  return text;
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
+const CSV_COLUMNS = [
+  "score",
+  "source",
+  "kind",
+  "title",
+  "journal",
+  "published",
+  "doi",
+  "url",
+  "geography",
+  "commodity",
+  "measure",
+  "keyword",
+  "searchUrl",
+];
+
 function toCsv(rows) {
-  const columns = ["source", "keyword", "title", "journal", "doi", "published", "url", "searchUrl"];
-  const lines = [columns.join(",")];
+  const lines = [CSV_COLUMNS.join(",")];
 
   for (const row of rows) {
-    lines.push(columns.map(column => csvEscape(row[column])).join(","));
+    lines.push(CSV_COLUMNS.map(column => csvEscape(row[column])).join(","));
   }
 
   return `${lines.join("\n")}\n`;
 }
 
-function dedupeItems(items) {
-  return items.filter(
-    (item, index, allItems) =>
-      item.title &&
-      item.url &&
-      allItems.findIndex(other => other.url === item.url || other.title === item.title) === index,
-  );
+// OpenAlex throttles hard over a long run and answers 429. Without a retry the
+// source silently contributes nothing for the rest of the run, which is exactly
+// what happened before this was added.
+async function fetchJson(url, attempt = 0) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": MAILTO ? `datasets-generator/2.0 (mailto:${MAILTO})` : USER_AGENT,
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+
+    if (response.status === 429 || response.status >= 500) {
+      if (attempt >= MAX_RETRIES) {
+        console.warn(`  ! ${response.status} after ${MAX_RETRIES} retries: ${new URL(url).host}`);
+        return null;
+      }
+
+      const retryAfter = Number(response.headers.get("retry-after"));
+      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : RETRY_BASE_MS * 2 ** attempt;
+
+      await sleep(backoffMs);
+
+      return fetchJson(url, attempt + 1);
+    }
+
+    if (!response.ok) return null;
+
+    return await response.json();
+  } catch {
+    return null;
+  }
 }
 
 async function fileExists(filePath) {
@@ -141,9 +140,7 @@ async function fileExists(filePath) {
 }
 
 async function getBrowserExecutablePath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
 
   for (const browserPath of SYSTEM_BROWSER_PATHS) {
     if (await fileExists(browserPath)) return browserPath;
@@ -152,27 +149,14 @@ async function getBrowserExecutablePath() {
   return null;
 }
 
-function getEnabledSites() {
-  const selectedSites = SITE_FILTER
-    .split(",")
-    .map(site => site.trim().toLowerCase())
+function isSourceEnabled(name) {
+  const selected = SOURCE_FILTER.split(",")
+    .map(entry => entry.trim().toLowerCase())
     .filter(Boolean);
 
-  if (selectedSites.length === 0) return sites;
+  if (selected.length === 0) return true;
 
-  return sites.filter(site =>
-    selectedSites.some(selectedSite => site.name.toLowerCase().includes(selectedSite)),
-  );
-}
-
-function isProbablyArticleLink(item, site) {
-  if (!item.title || item.title.length < 20 || !item.url) return false;
-  if (item.title.toLowerCase().includes("sign in")) return false;
-  if (item.title.toLowerCase().includes("subscribe")) return false;
-
-  if (!site.preferredLinkPatterns) return true;
-
-  return site.preferredLinkPatterns.some(pattern => item.url.includes(pattern));
+  return selected.some(entry => name.toLowerCase().includes(entry));
 }
 
 function isBlockedText(text) {
@@ -181,46 +165,30 @@ function isBlockedText(text) {
   return BLOCK_TEXT_MARKERS.some(marker => lowerText.includes(marker));
 }
 
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+function extractResultsFromHtml(html, source, searchUrl) {
+  if (!html) return [];
 
-function includesAnyTerm(text, terms) {
-  return terms.some(term => {
-    const pattern = new RegExp(`(^|[^a-z0-9])${escapeRegex(term)}([^a-z0-9]|$)`, "i");
-    return pattern.test(text);
+  const $ = cheerio.load(html);
+
+  if (isBlockedText($("body").text())) return [];
+
+  const anchors = source.selectors.flatMap(selector => $(selector).toArray());
+  const fallbackAnchors = $("a[href]")
+    .toArray()
+    .filter(anchor =>
+      source.preferredLinkPatterns.some(pattern => ($(anchor).attr("href") || "").includes(pattern)),
+    );
+
+  return [...anchors, ...fallbackAnchors].flatMap(anchor => {
+    const href = $(anchor).attr("href") || "";
+    const title = $(anchor).text() || $(anchor).attr("aria-label") || $(anchor).attr("title") || "";
+
+    try {
+      return [{ title: normalizeWhitespace(title), url: new URL(href, searchUrl).href }];
+    } catch {
+      return [];
+    }
   });
-}
-
-function getCommodityIntentTerms(keyword) {
-  const lowerKeyword = keyword.toLowerCase();
-  const intentTerms = [];
-
-  if (includesAnyTerm(lowerKeyword, FUEL_TERMS)) {
-    intentTerms.push(...FUEL_TERMS);
-  }
-
-  if (includesAnyTerm(lowerKeyword, FERTILIZER_TERMS)) {
-    intentTerms.push(...FERTILIZER_TERMS);
-  }
-
-  return [...new Set(intentTerms)];
-}
-
-function isRelevantCrossrefCandidate(item, keyword) {
-  if (!STRICT_CROSSREF_RELEVANCE) return true;
-
-  const commodityIntentTerms = getCommodityIntentTerms(keyword);
-
-  if (commodityIntentTerms.length === 0) return true;
-
-  return includesAnyTerm(item.title, commodityIntentTerms);
-}
-
-async function detectChallenge(page) {
-  const bodyText = await page.evaluate(() => document.body?.innerText?.toLowerCase() || "");
-
-  return isBlockedText(bodyText);
 }
 
 async function fetchSearchHtml(searchUrl) {
@@ -234,250 +202,191 @@ async function fetchSearchHtml(searchUrl) {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
-    if (!response.ok) return "";
-
-    return response.text();
+    return response.ok ? await response.text() : "";
   } catch {
     return "";
   }
 }
 
-function extractResultsFromHtml(html, site, searchUrl) {
-  if (!html) return [];
-
-  const $ = cheerio.load(html);
-  const bodyText = $("body").text();
-
-  if (isBlockedText(bodyText)) {
-    console.warn(`Skipped ${site.name}: block or access page detected.`);
-    return [];
-  }
-
-  const anchors = site.selectors.flatMap(selector => $(selector).toArray());
-  const fallbackAnchors = $("a[href]")
-    .toArray()
-    .filter(anchor => {
-      const href = $(anchor).attr("href") || "";
-      return site.preferredLinkPatterns.some(pattern => href.includes(pattern));
-    });
-
-  const items = [...anchors, ...fallbackAnchors].map(anchor => {
-    const href = $(anchor).attr("href") || "";
-    const title =
-      $(anchor).text() || $(anchor).attr("aria-label") || $(anchor).attr("title") || "";
-
-    try {
-      return {
-        title: normalizeWhitespace(title),
-        url: new URL(href, searchUrl).href,
-      };
-    } catch {
-      return { title: "", url: "" };
-    }
-  });
-
-  return dedupeItems(items).slice(0, MAX_RESULTS_PER_SEARCH);
-}
-
-async function extractResults(page, site) {
-  return page.evaluate(
-    ({ selectors, preferredLinkPatterns, maxResults }) => {
-      const makeAbsolute = href => {
-        try {
-          return new URL(href, window.location.origin).href;
-        } catch {
-          return "";
-        }
-      };
-
-      const anchors = selectors.flatMap(selector => [...document.querySelectorAll(selector)]);
-      const fallbackAnchors = [...document.querySelectorAll("a[href]")].filter(anchor =>
-        preferredLinkPatterns.some(pattern => anchor.href.includes(pattern)),
-      );
-
-      return [...anchors, ...fallbackAnchors]
-        .map(anchor => ({
-          title: anchor.innerText || anchor.textContent || anchor.getAttribute("aria-label") || "",
-          url: makeAbsolute(anchor.getAttribute("href") || anchor.href),
-        }))
-        .map(item => ({
-          title: item.title.replace(/\s+/g, " ").trim(),
-          url: item.url,
-        }))
-        .filter((item, index, items) =>
-          item.title &&
-          item.url &&
-          items.findIndex(other => other.url === item.url || other.title === item.title) === index,
-        )
-        .slice(0, maxResults);
-    },
-    {
-      selectors: site.selectors,
-      preferredLinkPatterns: site.preferredLinkPatterns,
-      maxResults: MAX_RESULTS_PER_SEARCH,
-    },
-  );
-}
-
-function formatResults(items, site, keyword, searchUrl) {
-  return items
-    .map(item => ({
-      source: site.name,
-      keyword,
-      title: normalizeWhitespace(item.title),
-      url: item.url,
-      searchUrl,
-    }))
-    .filter(item => isProbablyArticleLink(item, site));
-}
-
-async function searchCrossref(site, keyword) {
-  const params = new URLSearchParams({
-    "query.bibliographic": keyword,
-    filter: `issn:${site.issn},type:journal-article`,
-    rows: String(Math.min(MAX_RESULTS_PER_SEARCH * 10, 100)),
-  });
-
-  if (CROSSREF_MAILTO) {
-    params.set("mailto", CROSSREF_MAILTO);
-  }
-
-  const searchUrl = `https://api.crossref.org/works?${params.toString()}`;
-
-  try {
-    const response = await fetch(searchUrl, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": CROSSREF_MAILTO
-          ? `datasets-generator/1.0 (mailto:${CROSSREF_MAILTO})`
-          : USER_AGENT,
-      },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-
-    if (!response.ok) return [];
-
-    const data = await response.json();
-    const items = data.message?.items ?? [];
-
-    return items
-      .map(item => ({
-        source: site.name,
-        keyword,
-        title: normalizeWhitespace(item.title?.[0] ?? ""),
-        journal: item["container-title"]?.[0] ?? site.journal,
-        doi: item.DOI ?? "",
-        published:
-          item.published?.["date-time"] ??
-          item.published?.["date-parts"]?.[0]?.filter(Boolean).join("-") ??
-          "",
-        url: item.URL || (item.DOI ? `https://doi.org/${item.DOI}` : ""),
-        searchUrl,
-      }))
-      .filter(item => item.title && item.url && isRelevantCrossrefCandidate(item, keyword))
-      .slice(0, MAX_RESULTS_PER_SEARCH);
-  } catch {
-    return [];
-  }
-}
-
-async function createPage(browser) {
-  const page = await browser.newPage();
-  page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-
-  await page.setViewport({ width: 1366, height: 900 });
-  await page.setUserAgent(USER_AGENT);
-
-  return page;
-}
-
-async function searchSite(browser, site, keyword) {
-  if (site.type === "crossref") {
-    return searchCrossref(site, keyword);
-  }
-
-  const searchUrl = site.buildSearchUrl(keyword);
+async function searchBrowserSource(browser, source, query) {
+  const searchUrl = source.buildSearchUrl(query);
   const html = await fetchSearchHtml(searchUrl);
-  const htmlItems = formatResults(extractResultsFromHtml(html, site, searchUrl), site, keyword, searchUrl);
+  const staticItems = extractResultsFromHtml(html, source, searchUrl);
 
-  if (htmlItems.length > 0) {
-    return htmlItems;
+  if (staticItems.length > 0 || !browser) {
+    return staticItems.map(item => ({ ...item, searchUrl }));
   }
 
-  const page = await createPage(browser);
+  const page = await browser.newPage();
 
   try {
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: NAVIGATION_TIMEOUT_MS,
-    });
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+    await page.setViewport({ width: 1366, height: 900 });
+    await page.setUserAgent(USER_AGENT);
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
+    await sleep(2500);
 
-    await sleep(3000);
+    const renderedHtml = await page.content();
 
-    if (await detectChallenge(page)) {
-      console.warn(`Skipped ${site.name}: bot challenge or access block detected.`);
-      return [];
-    }
-
-    const items = await extractResults(page, site);
-
-    return formatResults(items, site, keyword, searchUrl);
+    return extractResultsFromHtml(renderedHtml, source, searchUrl).map(item => ({
+      ...item,
+      searchUrl,
+    }));
   } finally {
     await page.close().catch(() => {});
   }
 }
 
+// Repositories mint a fresh DOI per version -- 10.17632/63pxv64h75, .1, .4 and
+// figshare's .v1 are all the same deposit -- so the version suffix is stripped
+// before comparing.
+function normalizeDoi(doi) {
+  return doi
+    .toLowerCase()
+    .replace(/^https?:\/\/doi\.org\//, "")
+    .replace(/\.v?\d+$/, "");
+}
+
+// Title is the primary key: the same work reaches us from several sources under
+// preprint, version-of-record and mirror DOIs that no DOI normalization can
+// reconcile. DOI is the fallback for records with a missing or stub title.
+function dedupeKey(row) {
+  const normalizedTitle = row.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+  if (normalizedTitle.length >= 15) return `title:${normalizedTitle}`;
+
+  return row.doi ? `doi:${normalizeDoi(row.doi)}` : `title:${normalizedTitle}`;
+}
+
 async function main() {
   const keywords = await readKeywords();
-  const enabledSites = getEnabledSites();
-  const browserExecutablePath = await getBrowserExecutablePath();
-  const launchOptions = {
-    headless: "new",
-  };
+  const enabledApiSources = apiSources.filter(source => isSourceEnabled(source.name));
+  const enabledBrowserSources = SKIP_BROWSER
+    ? []
+    : browserSources.filter(source => isSourceEnabled(source.name));
 
-  if (browserExecutablePath) {
-    launchOptions.executablePath = browserExecutablePath;
+  const rowsByKey = new Map();
+  let examined = 0;
+
+  function record(candidate, sourceName, keyword) {
+    examined += 1;
+
+    if (!candidate.title || !candidate.url) return;
+
+    const relevance = scoreCandidate(candidate);
+
+    if (relevance.score < MIN_SCORE) return;
+
+    // A record with no commodity term is off-domain no matter how well it scores
+    // on geography and measure: "Cost benefit analysis of cassava production in
+    // Sherpur district of Bangladesh" clears the threshold on those two alone.
+    if (relevance.commodity.length === 0) return;
+    if (REQUIRE_TITLE_COMMODITY && !relevance.commodityInTitle) return;
+
+    const row = {
+      score: relevance.score,
+      source: sourceName,
+      kind: candidate.kind ?? "",
+      title: candidate.title,
+      journal: candidate.journal ?? "",
+      published: candidate.published ?? "",
+      doi: candidate.doi ?? "",
+      url: candidate.url,
+      abstract: candidate.abstract ?? "",
+      geography: relevance.geography.join("; "),
+      commodity: relevance.commodity.join("; "),
+      measure: relevance.measure.join("; "),
+      keyword,
+      searchUrl: candidate.searchUrl ?? "",
+    };
+
+    const key = dedupeKey(row);
+    const existing = rowsByKey.get(key);
+
+    // Keep the highest-scoring copy so the richest metadata wins.
+    if (existing && existing.score >= row.score) return;
+
+    rowsByKey.set(key, row);
   }
 
-  const browser = await puppeteer.launch({
-    ...launchOptions,
-  });
+  let browser = null;
 
-  const results = [];
-  const seen = new Set();
+  if (enabledBrowserSources.length > 0) {
+    const executablePath = await getBrowserExecutablePath();
+
+    browser = await puppeteer.launch({
+      headless: true,
+      ...(executablePath ? { executablePath } : {}),
+    });
+  }
 
   try {
-    for (const site of enabledSites) {
-      for (const keyword of keywords) {
-        console.log(`Searching ${site.name}: ${keyword}`);
+    for (const keyword of keywords) {
+      const variants = buildQueryVariants(keyword, MAX_QUERY_VARIANTS);
+      console.log(`\n${keyword}`);
+      console.log(`  variants: ${variants.join(" | ")}`);
 
-        try {
-          const items = await searchSite(browser, site, keyword);
-          console.log(`Found ${items.length} result(s).`);
+      for (const variant of variants) {
+        const apiResults = await Promise.all(
+          enabledApiSources.map(async source => {
+            try {
+              const items = await source.search(variant, {
+                rows: MAX_RESULTS_PER_SEARCH,
+                mailto: MAILTO,
+                fetchJson,
+              });
 
-          for (const item of items) {
-            const key = `${item.source}:${item.url}`;
-            if (seen.has(key)) continue;
+              return { source, items: items ?? [] };
+            } catch (error) {
+              console.warn(`  ! ${source.name}: ${error.message}`);
+              return { source, items: [] };
+            }
+          }),
+        );
 
-            seen.add(key);
-            results.push(item);
-          }
-        } catch (error) {
-          console.warn(`Failed ${site.name} / ${keyword}: ${error.message}`);
+        for (const { source, items } of apiResults) {
+          for (const item of items) record(item, source.name, keyword);
         }
 
+        for (const source of enabledBrowserSources) {
+          try {
+            const items = await searchBrowserSource(browser, source, variant);
+
+            for (const item of items) record(item, source.name, keyword);
+          } catch (error) {
+            console.warn(`  ! ${source.name}: ${error.message}`);
+          }
+        }
+
+        console.log(`  "${variant}" -> ${rowsByKey.size} kept so far`);
         await sleep(WAIT_BETWEEN_SEARCHES_MS);
       }
     }
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
   }
 
-  await fs.mkdir(OUTPUT_DIR, { recursive: true });
-  await fs.writeFile(path.join(OUTPUT_DIR, "articles.json"), JSON.stringify(results, null, 2));
-  await fs.writeFile(path.join(OUTPUT_DIR, "articles.csv"), toCsv(results));
+  const rows = [...rowsByKey.values()].sort(
+    (a, b) => b.score - a.score || a.title.localeCompare(b.title),
+  );
 
-  console.log(`Saved ${results.length} unique results to data/articles.json and data/articles.csv`);
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+  await fs.writeFile(path.join(OUTPUT_DIR, "articles.json"), JSON.stringify(rows, null, 2));
+  await fs.writeFile(path.join(OUTPUT_DIR, "articles.csv"), toCsv(rows));
+
+  console.log(`\nExamined ${examined} candidates, kept ${rows.length} at score >= ${MIN_SCORE}.`);
+
+  // Counted from the final rows, so a source only gets credit for records that
+  // actually survived dedupe.
+  const stats = new Map();
+
+  for (const row of rows) stats.set(row.source, (stats.get(row.source) ?? 0) + 1);
+
+  for (const [source, count] of [...stats].sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${source}: ${count}`);
+  }
+
+  console.log("\nSaved data/articles.json and data/articles.csv");
 }
 
 main().catch(error => {

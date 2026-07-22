@@ -4,6 +4,7 @@ import process from "node:process";
 import * as cheerio from "cheerio";
 import puppeteer from "puppeteer";
 import { gridToCsv, toCsv } from "./csv.js";
+import { readZipEntries } from "./zip.js";
 
 // Second stage: takes the scored discovery index produced by scraper.js and
 // pulls the actual content out of each article page.
@@ -13,6 +14,7 @@ const DATA_DIR = path.join(ROOT_DIR, "data");
 const INDEX_FILE = path.join(DATA_DIR, "articles.json");
 const TABLES_DIR = path.join(DATA_DIR, "tables");
 const DATASET_FILES_DIR = path.join(DATA_DIR, "dataset-files");
+const FIGURE_IMAGES_DIR = path.join(DATA_DIR, "figure-images");
 const RECORDS_JSON_FILE = path.join(DATA_DIR, "records.json");
 const RECORDS_CSV_FILE = path.join(DATA_DIR, "records.csv");
 const EXTRACT_LIMIT = Number(process.env.EXTRACT_LIMIT || 40);
@@ -25,7 +27,10 @@ const DOWNLOAD_DATASET_FILES = process.env.DOWNLOAD_DATASET_FILES !== "0";
 const DATASET_FILE_LIMIT = Number(process.env.DATASET_FILE_LIMIT || 3);
 const DATASET_MAX_BYTES = Number(process.env.DATASET_MAX_BYTES || 25 * 1024 * 1024);
 const DATASET_FETCH_TIMEOUT_MS = Number(process.env.DATASET_FETCH_TIMEOUT_MS || 30000);
+const DOWNLOAD_FIGURE_IMAGES = process.env.DOWNLOAD_FIGURE_IMAGES !== "0";
+const FIGURE_BUNDLE_MAX_BYTES = Number(process.env.FIGURE_BUNDLE_MAX_BYTES || 50 * 1024 * 1024);
 const MAILTO = process.env.CROSSREF_MAILTO || process.env.OPENALEX_MAILTO || "";
+const EUROPEPMC_REST = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 const USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36";
 
@@ -238,6 +243,7 @@ function flattenRecords(articleRecords) {
         parentRecordId: article.id,
         recordType: "evidence",
         evidenceType: "figure",
+        file: figure.file ?? "",
         url: figure.imageUrl,
         articleUrl: figure.articleUrl,
         caption: figure.caption,
@@ -343,6 +349,54 @@ function extractTableGrid($, table) {
   return grid;
 }
 
+function collectHtmlTables($) {
+  return $("table")
+    .toArray()
+    .map((table, domIndex) => ({
+      grid: extractTableGrid($, table),
+      caption: findTableCaption($, table),
+      domIndex,
+      source: "html_table",
+    }));
+}
+
+// JATS wraps every real table in <table-wrap>, with the label ("Table 1") and
+// caption as siblings of the <table> rather than inside it.
+function collectJatsTables($) {
+  return $("table-wrap")
+    .toArray()
+    .map((wrap, domIndex) => {
+      const table = $(wrap).find("table").first();
+      const label = normalizeWhitespace($(wrap).find("label").first().text());
+      const caption = normalizeWhitespace($(wrap).find("caption").first().text());
+
+      return {
+        grid: table.length > 0 ? extractTableGrid($, table) : [],
+        caption: [label, caption].filter(Boolean).join(" "),
+        domIndex,
+        source: "jats_table",
+      };
+    });
+}
+
+function collectJatsFigures($, pmcid) {
+  return $("fig")
+    .toArray()
+    .map(fig => {
+      const label = normalizeWhitespace($(fig).find("label").first().text());
+      const caption = normalizeWhitespace($(fig).find("caption").first().text());
+      const graphic = $(fig).find("graphic").first();
+      const href = graphic.attr("xlink:href") || graphic.attr("href") || "";
+      const fileName = href && !/\.[a-z0-9]+$/i.test(href) ? `${href}.jpg` : href;
+
+      return {
+        caption: [label, caption].filter(Boolean).join(" "),
+        graphic: href,
+        imageUrl: fileName ? `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/bin/${fileName}` : "",
+      };
+    });
+}
+
 function extractFigures($, pageUrl) {
   const figures = [];
 
@@ -372,8 +426,10 @@ function extractFigures($, pageUrl) {
 function extractDataLinks($, pageUrl) {
   const links = new Map();
 
-  $("a[href]").each((_, anchor) => {
-    const rawHref = $(anchor).attr("href") || "";
+  // JATS carries external links as <ext-link xlink:href>, not <a href>.
+  $("a[href], ext-link").each((_, anchor) => {
+    const rawHref =
+      $(anchor).attr("href") || $(anchor).attr("xlink:href") || "";
     const text = normalizeWhitespace($(anchor).text());
 
     if (!DATA_REPOSITORY_HOSTS.some(host => rawHref.includes(host))) return;
@@ -488,6 +544,79 @@ function parseFigshareArticleId(url) {
   const doiMatch = String(url).match(/10\.6084\/m9\.figshare\.(\d+)/i);
 
   return doiMatch?.[1] ?? "";
+}
+
+// Mendeley Data is the default deposit target for Elsevier data journals
+// (Data in Brief especially). The landing page is a JS app, so link-scraping the
+// HTML finds nothing; the public API lists the files directly.
+function parseMendeleyDatasetRef(url) {
+  const pageMatch = String(url).match(/data\.mendeley\.com\/datasets\/([a-z0-9]+)(?:\/(\d+))?/i);
+  if (pageMatch) return { id: pageMatch[1], version: pageMatch[2] ?? "" };
+
+  const doiMatch = String(url).match(/10\.17632\/([a-z0-9]+)(?:\.(\d+))?/i);
+  if (doiMatch) return { id: doiMatch[1], version: doiMatch[2] ?? "" };
+
+  return null;
+}
+
+async function mendeleyFileCandidates(ref) {
+  if (!ref?.id) return [];
+
+  let { version } = ref;
+
+  // A bare dataset URL carries no version, and the files endpoint requires one.
+  if (!version) {
+    const metadata = await fetchJson(`https://data.mendeley.com/public-api/datasets/${ref.id}`);
+    version = String(metadata?.doi?.id ?? "").match(/\.(\d+)$/)?.[1] ?? "1";
+  }
+
+  const files = await fetchJson(
+    `https://data.mendeley.com/public-api/datasets/${ref.id}/files?folder_id=root&version=${version}`,
+  );
+
+  if (!Array.isArray(files)) return [];
+
+  return files.flatMap(file => {
+    const url = file.content_details?.download_url || "";
+    if (!url) return [];
+
+    return [
+      {
+        url,
+        fileName: file.filename || fileNameFromUrl(url),
+        size: file.size ?? "",
+        source: "mendeley_api",
+      },
+    ];
+  });
+}
+
+// Publishers increasingly register the deposited dataset as a Crossref relation
+// rather than linking it in body text, and PMC copies drop the link entirely.
+async function resolveCrossrefSupplements(doi) {
+  if (!doi) return [];
+
+  const data = await fetchJson(
+    `https://api.crossref.org/works/${encodeURIComponent(doi)}${
+      MAILTO ? `?mailto=${encodeURIComponent(MAILTO)}` : ""
+    }`,
+  );
+  const relations = data?.message?.relation ?? {};
+  const links = [];
+
+  for (const [relationType, entries] of Object.entries(relations)) {
+    if (!/supplement|data/i.test(relationType)) continue;
+
+    for (const entry of entries ?? []) {
+      const id = String(entry?.id ?? "");
+      if (!id) continue;
+
+      const url = /^https?:\/\//i.test(id) ? id : `https://doi.org/${id}`;
+      links.push({ url, text: `crossref ${relationType}` });
+    }
+  }
+
+  return uniqueBy(links, link => link.url);
 }
 
 async function resolveLandingUrl(url) {
@@ -627,6 +756,22 @@ async function genericHtmlFileCandidates(url) {
   return uniqueBy(candidates, candidate => candidate.url).slice(0, DATASET_FILE_LIMIT * 3);
 }
 
+// The same deposit reaches us in several spellings — a Crossref relation gives
+// the DOI, the article body gives the landing page. Collapse them so a dataset
+// is not downloaded once per spelling.
+function datasetIdentity(url) {
+  const mendeley = parseMendeleyDatasetRef(url);
+  if (mendeley) return `mendeley:${mendeley.id}`;
+
+  const zenodo = parseZenodoRecordId(url);
+  if (zenodo) return `zenodo:${zenodo}`;
+
+  const figshare = parseFigshareArticleId(url);
+  if (figshare) return `figshare:${figshare}`;
+
+  return String(url).replace(/\/+$/, "").toLowerCase();
+}
+
 async function resolveDatasetFileCandidates(datasetUrl) {
   const resolvedUrl = isDataFileUrl(datasetUrl) ? datasetUrl : await resolveLandingUrl(datasetUrl);
   const urlsToInspect = uniqueBy([datasetUrl, resolvedUrl].filter(Boolean), url => url);
@@ -644,6 +789,7 @@ async function resolveDatasetFileCandidates(datasetUrl) {
 
     candidates.push(...(await zenodoFileCandidates(parseZenodoRecordId(url))));
     candidates.push(...(await figshareFileCandidates(parseFigshareArticleId(url))));
+    candidates.push(...(await mendeleyFileCandidates(parseMendeleyDatasetRef(url))));
   }
 
   if (candidates.length === 0 && /^https?:\/\//i.test(resolvedUrl)) {
@@ -788,16 +934,91 @@ async function fetchJson(url) {
 // not challenge headless clients, so it is the preferred target whenever the DOI
 // has a PMC copy. OpenAlex's own ids.pmcid is usually empty; Europe PMC's search
 // resolves it reliably.
-async function resolvePmcUrl(doi) {
+async function resolvePmcId(doi) {
   if (!doi) return "";
 
   const query = encodeURIComponent(`DOI:"${doi}"`);
   const data = await fetchJson(
-    `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${query}&format=json&resultType=core`,
+    `${EUROPEPMC_REST}/search?query=${query}&format=json&resultType=core`,
   );
-  const pmcid = data?.resultList?.result?.[0]?.pmcid;
 
+  return data?.resultList?.result?.[0]?.pmcid ?? "";
+}
+
+function pmcArticleUrl(pmcid) {
   return pmcid ? `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/` : "";
+}
+
+// PMC's /bin/ image URLs sit behind the same reCAPTCHA as its article pages.
+// Europe PMC serves every figure raster for an article as one zip instead.
+async function fetchFigureImageBundle(pmcid) {
+  if (!pmcid || !DOWNLOAD_FIGURE_IMAGES) return null;
+
+  try {
+    const response = await fetch(`${EUROPEPMC_REST}/${pmcid}/supplementaryFiles`, {
+      headers: { Accept: "application/zip", "User-Agent": USER_AGENT },
+      signal: AbortSignal.timeout(DATASET_FETCH_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      if (response.body) await response.body.cancel().catch(() => {});
+
+      return null;
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength === 0 || buffer.byteLength > FIGURE_BUNDLE_MAX_BYTES) return null;
+
+    return readZipEntries(buffer);
+  } catch {
+    return null;
+  }
+}
+
+// A figure's <graphic> names the image without an extension ("gr1"), while the
+// bundle carries several renditions of it. Raster beats the vector-ish GIF
+// thumbnails Elsevier ships alongside.
+function pickFigureImage(bundle, graphic) {
+  if (!bundle || !graphic) return null;
+
+  const base = graphic.replace(/\.[a-z0-9]+$/i, "").toLowerCase();
+  const matches = [...bundle.keys()].filter(
+    name => path.basename(name).replace(/\.[a-z0-9]+$/i, "").toLowerCase() === base,
+  );
+
+  if (matches.length === 0) return null;
+
+  const preference = [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif"];
+  const rank = name => {
+    const position = preference.indexOf(path.extname(name).toLowerCase());
+
+    return position < 0 ? preference.length : position;
+  };
+  const best = matches.sort((a, b) => rank(a) - rank(b))[0];
+
+  return { name: path.basename(best), data: bundle.get(best) };
+}
+
+// PMC's own site now intermittently answers headless clients with a reCAPTCHA
+// interstitial, which reads as an article with zero tables. Europe PMC serves
+// the same open-access text as JATS XML with no bot wall, so it is tried first.
+async function fetchJatsFullText(pmcid) {
+  if (!pmcid) return null;
+
+  try {
+    const response = await fetch(`${EUROPEPMC_REST}/${pmcid}/fullTextXML`, {
+      headers: { Accept: "application/xml", "User-Agent": USER_AGENT },
+      signal: AbortSignal.timeout(25000),
+    });
+
+    if (!response.ok) return null;
+
+    const xml = await response.text();
+
+    return xml.includes("<article") ? xml : null;
+  } catch {
+    return null;
+  }
 }
 
 async function resolveOaUrl(doi) {
@@ -814,8 +1035,8 @@ async function resolveOaUrl(doi) {
 
 // Ordered best-first: an open full-text copy beats the publisher DOI, which for
 // Elsevier just lands on a bot wall.
-async function resolveCandidateUrls(row) {
-  const candidates = [await resolvePmcUrl(row.doi), await resolveOaUrl(row.doi), row.url];
+async function resolveCandidateUrls(row, pmcid) {
+  const candidates = [pmcArticleUrl(pmcid), await resolveOaUrl(row.doi), row.url];
 
   return [...new Set(candidates.filter(Boolean).filter(url => !isBlockedHost(url)))];
 }
@@ -878,6 +1099,7 @@ async function main() {
 
   await fs.mkdir(TABLES_DIR, { recursive: true });
   await fs.mkdir(DATASET_FILES_DIR, { recursive: true });
+  await fs.mkdir(FIGURE_IMAGES_DIR, { recursive: true });
 
   const executablePath = await getBrowserExecutablePath();
   const browser = await puppeteer.launch({
@@ -891,6 +1113,7 @@ async function main() {
   let pagesLoaded = 0;
   let pagesFailed = 0;
   let downloadedDatasetFiles = 0;
+  let downloadedFigureImages = 0;
 
   try {
     for (const [position, row] of targets.entries()) {
@@ -898,15 +1121,32 @@ async function main() {
       const articleRecord = articleRecords[position];
       const slug = articleRecord.id;
 
-      const candidates = await resolveCandidateUrls(row);
+      const pmcid = await resolvePmcId(row.doi);
+      const candidates = await resolveCandidateUrls(row, pmcid);
       articleRecord.extraction.attempted = true;
       articleRecord.extraction.candidateUrls = candidates;
 
       let html = "";
       let finalUrl = "";
       let mode = "";
+      let isJats = false;
 
-      for (const candidate of candidates) {
+      const jats = await fetchJatsFullText(pmcid);
+
+      if (jats) {
+        const $jats = cheerio.load(jats, { xmlMode: true });
+
+        // A JATS record with neither tables nor figures is usually an
+        // abstract-only stub; the rendered page may still have the real thing.
+        if ($jats("table-wrap").length > 0 || $jats("fig").length > 0) {
+          html = jats;
+          isJats = true;
+          mode = "europepmc_xml";
+          finalUrl = `https://europepmc.org/article/PMC/${pmcid}`;
+        }
+      }
+
+      for (const candidate of html ? [] : candidates) {
         let loaded;
 
         try {
@@ -949,13 +1189,13 @@ async function main() {
       articleRecord.extraction.mode = mode;
       articleRecord.extraction.finalUrl = finalUrl;
 
-      const $ = cheerio.load(html);
+      const $ = cheerio.load(html, isJats ? { xmlMode: true } : undefined);
       let savedTables = 0;
 
-      const tables = $("table").toArray();
+      const tables = isJats ? collectJatsTables($) : collectHtmlTables($);
 
-      for (const [tableIndex, table] of tables.entries()) {
-        const grid = extractTableGrid($, table);
+      for (const table of tables) {
+        const { grid } = table;
         const columnCount = Math.max(0, ...grid.map(cells => cells.length));
 
         // Layout tables and single-value boxes are not data.
@@ -971,12 +1211,12 @@ async function main() {
           id: evidenceId(slug, "table", savedTables),
           file,
           tableNumber: savedTables,
-          caption: findTableCaption($, table),
+          caption: table.caption,
           rows: grid.length,
           columns: columnCount,
           articleUrl: finalUrl,
-          domIndex: tableIndex,
-          source: "html_table",
+          domIndex: table.domIndex,
+          source: table.source,
         };
 
         articleRecord.extraction.tables.push(tableRecord);
@@ -992,17 +1232,31 @@ async function main() {
           rows: grid.length,
           columns: columnCount,
           articleUrl: finalUrl,
-          domIndex: tableIndex,
+          domIndex: table.domIndex,
         });
       }
 
-      const figures = extractFigures($, finalUrl);
+      const figures = isJats ? collectJatsFigures($, pmcid) : extractFigures($, finalUrl);
+      const figureBundle = isJats && figures.length > 0 ? await fetchFigureImageBundle(pmcid) : null;
+      let savedFigureImages = 0;
 
       for (const [figureIndex, figure] of figures.entries()) {
+        const figureNumber = figureIndex + 1;
+        const image = pickFigureImage(figureBundle, figure.graphic);
+        let file = "";
+
+        if (image?.data) {
+          const imageFileName = `${slug}-fig${figureNumber}-${safeFileName(image.name, "figure")}`;
+          file = path.join("data", "figure-images", imageFileName);
+          await fs.writeFile(path.join(FIGURE_IMAGES_DIR, imageFileName), image.data);
+          savedFigureImages += 1;
+        }
+
         const figureRecord = {
-          id: evidenceId(slug, "figure", figureIndex + 1),
-          figureNumber: figureIndex + 1,
+          id: evidenceId(slug, "figure", figureNumber),
+          figureNumber,
           caption: figure.caption,
+          file,
           imageUrl: figure.imageUrl,
           articleUrl: finalUrl,
         };
@@ -1012,15 +1266,24 @@ async function main() {
         figureRows.push({
           doi: row.doi,
           title: row.title,
-          figureNumber: figureRecord.figureNumber,
+          figureNumber,
           caption: figure.caption,
+          file,
           imageUrl: figure.imageUrl,
           articleUrl: finalUrl,
         });
       }
 
-      const dataLinks = extractDataLinks($, finalUrl);
-      if (shouldTreatRecordUrlAsDatasetLink(row) && !dataLinks.some(link => link.url === row.url)) {
+      downloadedFigureImages += savedFigureImages;
+
+      const dataLinks = uniqueBy(
+        [...(await resolveCrossrefSupplements(row.doi)), ...extractDataLinks($, finalUrl)],
+        link => datasetIdentity(link.url),
+      );
+      if (
+        shouldTreatRecordUrlAsDatasetLink(row) &&
+        !dataLinks.some(link => datasetIdentity(link.url) === datasetIdentity(row.url))
+      ) {
         dataLinks.unshift({ url: row.url, text: "record URL" });
       }
 
@@ -1083,7 +1346,10 @@ async function main() {
 
   await fs.writeFile(
     path.join(DATA_DIR, "figures.csv"),
-    toCsv(["doi", "title", "figureNumber", "caption", "imageUrl", "articleUrl"], figureRows),
+    toCsv(
+      ["doi", "title", "figureNumber", "caption", "file", "imageUrl", "articleUrl"],
+      figureRows,
+    ),
   );
 
   await fs.writeFile(
@@ -1140,7 +1406,7 @@ async function main() {
       "",
       `Pages loaded ${pagesLoaded}, failed ${pagesFailed}.`,
       `Tables:   ${tableIndexRows.length} -> data/tables/*.csv (index: data/tables.csv)`,
-      `Figures:  ${figureRows.length} -> data/figures.csv`,
+      `Figures:  ${figureRows.length} captions, ${downloadedFigureImages} images -> data/figures.csv and data/figure-images/*`,
       `Datasets: ${datasetRows.length} links, ${downloadedDatasetFiles} files -> data/datasets.csv and data/dataset-files/*`,
       `Records:  ${articleRecords.length} -> data/records.json and data/records.csv`,
     ].join("\n"),
